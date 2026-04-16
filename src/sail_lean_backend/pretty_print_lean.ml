@@ -18,6 +18,14 @@ let opt_extern_types : string list ref = ref []
 
 let opt_line_width : int ref = ref 100
 
+(* Maximum constructors per inductive type before splitting into partitions.
+   Lean runtime limits tags to 243 (8-bit m_tag, 244-255 reserved).
+   Default 200 leaves headroom for future growth. 0 to disable. *)
+let opt_max_constructors : int ref = ref 200
+
+(* Maps constructor id -> (partition_index, partition_type_id) for split types *)
+let split_ctor_map : (int * id) Bindings.t ref = ref Bindings.empty
+
 type global_context = {
   effect_info : Effects.side_effect_info;
   fun_args : string list Bindings.t;
@@ -493,6 +501,23 @@ let rec update_ctx_pat (ctx : context) (P_aux (p, (l, annot)) as pat) =
       List.fold_left update_ctx_pat ctx pats
   | _ -> ctx
 
+(* Split a list into chunks of at most n elements *)
+let chunk_list n lst =
+  let rec aux acc current count = function
+    | [] -> List.rev (if current = [] then acc else List.rev current :: acc)
+    | x :: xs ->
+        if count >= n then aux (List.rev current :: acc) [x] 1 xs
+        else aux acc (x :: current) (count + 1) xs
+  in
+  aux [] [] 0 lst
+
+(* Generate partition type id: e.g., instruction -> instruction_part0 *)
+let partition_type_id (base_id : id) (idx : int) : id =
+  mk_id (string_of_id base_id ^ "_part" ^ string_of_int idx)
+
+(* Generate partition constructor id: e.g., 0 -> part0 *)
+let partition_ctor_id (idx : int) : id = mk_id ("part" ^ string_of_int idx)
+
 let rec doc_pat ?(need_parens = false) ?(in_vector = false) ctx in_match_bv (P_aux (p, (l, annot)) as pat) =
   let opt_parens doc = if need_parens then parens doc else doc in
   let env = env_of_tannot annot in
@@ -522,6 +547,20 @@ let rec doc_pat ?(need_parens = false) ?(in_vector = false) ctx in_match_bv (P_a
   | P_vector pats -> concat (List.map (doc_pat ~in_vector:true ctx in_match_bv) pats)
   | P_vector_concat pats -> doc_vector_concat pats
   | P_app (Id_aux (Id "None", _), p) -> string "none"
+  | P_app (cons, pats) when Bindings.mem cons !split_ctor_map ->
+      let part_idx, _part_id = Bindings.find cons !split_ctor_map in
+      let inner_pat =
+        string "."
+        ^^ doc_id_ctor (fixup_match_id cons)
+        ^^ space
+        ^^ separate_map (string ", ") (doc_pat ~need_parens:true ctx in_match_bv) pats
+      in
+      opt_parens
+        (string "."
+        ^^ doc_id_ctor (partition_ctor_id part_idx)
+        ^^ space
+        ^^ parens inner_pat
+        )
   | P_app (cons, pats) ->
       opt_parens
         (string "."
@@ -945,6 +984,13 @@ and doc_exp (as_monadic : bool) ctx (E_aux (e, (l, annot)) as full_exp) =
   | E_app ((Id_aux (Id "early_return", _) as f), [arg]) ->
       let throw = if ctx.in_sail_monad then string "SailME.throw " else string "throw " in
       nest 2 (throw ^^ d_of_arg ctx arg)
+  | E_app (f, args) when Bindings.mem f !split_ctor_map -> (
+      let part_idx, _part_id = Bindings.find f !split_ctor_map in
+      let d_args = List.map (d_of_arg ctx) args in
+      let inner = parens (flow (break 1) (doc_id_ctor f :: d_args)) in
+      let outer = doc_id_ctor (partition_ctor_id part_idx) ^^ space ^^ inner in
+      wrap_with_pure as_monadic (parens outer)
+    )
   | E_app (f, args) -> (
       let _, f_typ = Env.get_val_spec f env in
       let implicits = get_fn_implicits f_typ in
@@ -1390,19 +1436,75 @@ let doc_typdef ctx (TD_aux (td, tannot) as full_typdef) =
       nest 2 (flow (break 1) [string "abbrev"; doc_id_ctor id; colon; string "Bool"; coloneq; doc_nconstraint ctx nc])
   | TD_abbrev _ -> empty
   | TD_variant (id, tq, ar, _) ->
-      let pp_tus = concat (List.map (fun tu -> hardline ^^ doc_type_union ctx tu) ar) in
       let rectyp = doc_typ_quant_relevant ctx tq in
       let rectyp = List.map (fun d -> parens d) rectyp |> separate space in
-      let _ = opens := IdSet.add id !opens in
-      let derivers = [string "Repr"] in
-      let derivers = if IdSet.mem id !non_beq_types then derivers else string "BEq" :: derivers in
-      let derivers = if List.length ar == 0 then derivers else string "Inhabited" :: derivers in
-      doc_typ_quant_in_comment ctx tq
-      ^^ nest 2
-           (nest 2 (flow space (remove_empties [string "inductive"; doc_id_ctor id; rectyp; string "where"]))
-           ^^ pp_tus ^^ hardline ^^ string "deriving" ^^ space ^^ separate comma_sp derivers ^^ hardline
-           ^^ string "open" ^^ space ^^ doc_id_ctor id
-           )
+      let skip_beq = IdSet.mem id !non_beq_types in
+      let max_ctors = !opt_max_constructors in
+      if max_ctors > 0 && List.length ar > max_ctors then begin
+        (* Split large variant into partition sub-types + wrapper *)
+        let chunks = chunk_list max_ctors ar in
+        let n_parts = List.length chunks in
+        Printf.eprintf "  Splitting %s: %d constructors into %d partitions of max %d\n%!"
+          (string_of_id id) (List.length ar) n_parts max_ctors;
+        (* Populate split_ctor_map *)
+        List.iteri (fun part_idx chunk ->
+          let part_id = partition_type_id id part_idx in
+          List.iter (fun (Tu_aux (Tu_ty_id (_, ctor_id), _)) ->
+            split_ctor_map := Bindings.add ctor_id (part_idx, part_id) !split_ctor_map
+          ) chunk
+        ) chunks;
+        (* Generate partition types *)
+        let partition_docs = List.mapi (fun part_idx chunk ->
+          let part_id = partition_type_id id part_idx in
+          opens := IdSet.add part_id !opens;
+          let pp_tus = concat (List.map (fun tu -> hardline ^^ doc_type_union ctx tu) chunk) in
+          let derivers = [string "Repr"] in
+          let derivers = if skip_beq then derivers else string "BEq" :: derivers in
+          let derivers = if List.length chunk == 0 then derivers else string "Inhabited" :: derivers in
+          nest 2
+            (nest 2 (flow space (remove_empties [string "inductive"; doc_id_ctor part_id; rectyp; string "where"]))
+            ^^ pp_tus ^^ hardline ^^ string "deriving" ^^ space ^^ separate comma_sp derivers ^^ hardline
+            ^^ string "open" ^^ space ^^ doc_id_ctor part_id
+            )
+        ) chunks in
+        (* Generate wrapper type *)
+        opens := IdSet.add id !opens;
+        let rectyp_args =
+          (* Just the type variable names for applying to partition types *)
+          let vars = doc_typ_quant_only_vars ctx tq in
+          if vars = [] then empty else space ^^ separate space vars
+        in
+        let wrapper_ctors = List.mapi (fun part_idx _chunk ->
+          let part_id = partition_type_id id part_idx in
+          hardline ^^ nest 2 (flow space [pipe; doc_id_ctor (partition_ctor_id part_idx);
+            parens (flow space [underscore; colon; doc_id_ctor part_id ^^ rectyp_args])])
+        ) chunks in
+        let wrapper_derivers = [string "Repr"] in
+        let wrapper_derivers = if skip_beq then wrapper_derivers else string "BEq" :: wrapper_derivers in
+        let wrapper_derivers = string "Inhabited" :: wrapper_derivers in
+        let wrapper_doc = nest 2
+          (nest 2 (flow space (remove_empties [string "inductive"; doc_id_ctor id; rectyp; string "where"]))
+          ^^ concat wrapper_ctors ^^ hardline
+          ^^ string "deriving" ^^ space ^^ separate comma_sp wrapper_derivers ^^ hardline
+          ^^ string "open" ^^ space ^^ doc_id_ctor id
+          )
+        in
+        doc_typ_quant_in_comment ctx tq
+        ^^ separate (hardline ^^ hardline) (partition_docs @ [wrapper_doc])
+      end
+      else begin
+        let pp_tus = concat (List.map (fun tu -> hardline ^^ doc_type_union ctx tu) ar) in
+        let _ = opens := IdSet.add id !opens in
+        let derivers = [string "Repr"] in
+        let derivers = if skip_beq then derivers else string "BEq" :: derivers in
+        let derivers = if List.length ar == 0 then derivers else string "Inhabited" :: derivers in
+        doc_typ_quant_in_comment ctx tq
+        ^^ nest 2
+             (nest 2 (flow space (remove_empties [string "inductive"; doc_id_ctor id; rectyp; string "where"]))
+             ^^ pp_tus ^^ hardline ^^ string "deriving" ^^ space ^^ separate comma_sp derivers ^^ hardline
+             ^^ string "open" ^^ space ^^ doc_id_ctor id
+             )
+      end
   | _ -> failwith ("Type definition " ^ string_of_type_def_con full_typdef ^ " not translatable yet.")
 
 (* Copied from the Coq PP *)
@@ -1719,6 +1821,7 @@ let collect_import_files defs base =
 
 let pp_ast_lean (env : Type_check.env) effect_info ({ defs; _ } as ast : Libsail.Type_check.typed_ast) out_name_camel
     types_file imp_funcs_files funcs_file noncomputable =
+  split_ctor_map := Bindings.empty;
   let regs = State.find_registers defs in
   let fun_args = populate_fun_args defs in
   let global = { effect_info; fun_args; kid_id_renames = KBindings.empty; kid_id_renames_rev = Bindings.empty } in

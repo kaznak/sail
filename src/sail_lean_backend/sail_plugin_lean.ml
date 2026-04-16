@@ -174,6 +174,10 @@ let lean_options =
       Arg.Int (fun n -> Pretty_print_lean.opt_flatten_threshold := n),
       "flatten nested Option match chains with more than N branches (default 20, 0 to disable)"
     );
+    ( Flag.create ~prefix:["lean"] ~arg:"N" "max_constructors",
+      Arg.Int (fun n -> Pretty_print_lean.opt_max_constructors := n),
+      "split inductive types with more than N constructors (default 200, Lean limit is 243, 0 to disable)"
+    );
   ]
 
 (* TODO[javra]: Currently these are the same as the Coq rewrites, we might want to change them. *)
