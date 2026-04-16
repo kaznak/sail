@@ -672,6 +672,40 @@ let has_effect_app e =
 
 let has_effect e = effectful (effect_of e) || has_effect_app e
 
+(* Threshold: minimum number of nested Option match branches to trigger flattening.
+   When a function body is a chain of:
+     match (← try_block) with | .some result => pure result | none => <next>
+   with more than this many levels, the chain is flattened to:
+     let r0_ ← try_block_0; if let some v := r0_ then return v; ...
+   This reduces nesting depth from O(n) to O(1), drastically improving
+   elaboration time and avoiding Clang's -fbracket-depth limit. *)
+let opt_flatten_threshold : int ref = ref 20
+
+(* Check if a pattern matches the 'Some' constructor *)
+let is_some_pattern = function P_aux (P_app (Id_aux (Id "Some", _), _), _) -> true | _ -> false
+
+(* Unwrap single-element E_block wrappers *)
+let rec unwrap_single_block = function E_aux (E_block [e], _) -> unwrap_single_block e | e -> e
+
+(* Flatten a nested Option match chain.
+   Detects the pattern:
+     match <discr> with | Some result => <success> | None/_ => <continuation>
+   where <continuation> contains another such match.
+   Returns Some (discriminants, fallback) or None if not this pattern. *)
+let rec flatten_option_match_chain exp =
+  match exp with
+  | E_aux (E_match (discr, [branch_some; branch_none]), _) -> (
+      match (branch_some, branch_none) with
+      | Pat_aux (Pat_exp (pat_s, _), _), Pat_aux (Pat_exp (_pat_n, continuation), _) when is_some_pattern pat_s -> (
+          let continuation = unwrap_single_block continuation in
+          match flatten_option_match_chain continuation with
+          | Some (rest, fallback) -> Some (discr :: rest, fallback)
+          | None -> Some ([discr], continuation)
+        )
+      | _ -> None
+    )
+  | _ -> None
+
 let doc_loop_var (E_aux (e, (l, _)) as exp) =
   match e with
   | E_id id ->
@@ -1179,6 +1213,21 @@ let untranslatable_mapping id exp =
   let id = string_of_id id in
   if Str.string_match mapping_regex id 0 then false else exp_match exp
 
+(* Generate flat code for a chain of Option try blocks.
+   Instead of deeply nested: match (← try0) with | some r => pure r | none => match (← try1) ...
+   Generates flat: let r0_ ← try0; if let some v := r0_ then return v; let r1_ ← try1; ... *)
+let doc_flat_option_chain ctx blocks fallback =
+  let gen_block idx discr =
+    let var_name = Printf.sprintf "r%d_" idx in
+    nest 2 (string ("let " ^ var_name ^ " ← do") ^^ hardline ^^ doc_exp true ctx discr)
+    ^^ hardline
+    ^^ string (Printf.sprintf "if let some v := %s then return v" var_name)
+    ^^ hardline
+  in
+  let blocks_doc = concat (List.mapi gen_block blocks) in
+  let fallback_doc = doc_exp true ctx fallback in
+  blocks_doc ^^ fallback_doc
+
 let doc_funcl_body fixup_binders ctx (FCL_aux (FCL_funcl (id, pexp), annot)) =
   let env = env_of_tannot (snd annot) in
   let _, _, exp, _ = destruct_pexp pexp in
@@ -1186,7 +1235,57 @@ let doc_funcl_body fixup_binders ctx (FCL_aux (FCL_funcl (id, pexp), annot)) =
      this adds a let binding at the beginning of the function, of the form [let x := (arg0, arg1)] *)
   let exp = fixup_binders exp in
   let is_monadic = has_effect exp || not (Effects.function_is_pure id ctx.global.effect_info) in
-  if untranslatable_mapping id exp then string "throw Error.Exit" else doc_exp is_monadic (context_with_env ctx env) exp
+  if untranslatable_mapping id exp then string "throw Error.Exit"
+  else
+    let ctx' = context_with_env ctx env in
+    (* Check for large nested Option match chain and flatten if above threshold.
+       The expression may have E_let wrappers (e.g., let head_exp_ := arg_) before
+       the match chain, so we skip them to find the inner match. *)
+    let rec skip_lets e =
+      match e with
+      | E_aux (E_let (_, _, body), _) | E_aux (E_internal_plet (_, _, body), _) -> skip_lets body
+      | _ -> e
+    in
+    let inner_exp = skip_lets exp in
+    ( match flatten_option_match_chain inner_exp with
+    | Some (blocks, fallback) when List.length blocks >= !opt_flatten_threshold ->
+        Printf.eprintf "  Flattening %s: %d branches\n%!" (string_of_id id) (List.length blocks);
+        (* Replace the inner match with a placeholder, render the let prefix via
+           normal doc_exp, then substitute the flat chain for the placeholder. *)
+        let rec replace_inner_match e =
+          match e with
+          | E_aux (E_let (pat, bind, body), annot) ->
+              E_aux (E_let (pat, bind, replace_inner_match body), annot)
+          | E_aux (E_internal_plet (pat, bind, body), annot) ->
+              E_aux (E_internal_plet (pat, bind, replace_inner_match body), annot)
+          | _ ->
+              (* Replace the match chain with a simple placeholder that returns unit.
+                 We'll splice in the flat chain after rendering the let prefix. *)
+              e (* This path means we're at the match - we handle it below *)
+        in
+        (* Simpler approach: render let prefixes manually, then the flat chain *)
+        let rec doc_let_prefix e =
+          match e with
+          | E_aux (E_let (pat, bind, body), annot) ->
+              let env' = env_of_tannot (snd annot) in
+              let ctx'' = context_with_env ctx' env' in
+              let pat_doc = doc_pat ctx'' false pat in
+              let bind_doc = doc_exp false ctx'' bind in
+              string "let " ^^ pat_doc ^^ string " := " ^^ bind_doc ^^ hardline
+              ^^ doc_let_prefix body
+          | E_aux (E_internal_plet (pat, bind, body), annot) ->
+              let env' = env_of_tannot (snd annot) in
+              let ctx'' = context_with_env ctx' env' in
+              let pat_doc = doc_pat ctx'' false pat in
+              let bind_doc = doc_exp true ctx'' bind in
+              string "let " ^^ pat_doc ^^ string " ← " ^^ bind_doc ^^ hardline
+              ^^ doc_let_prefix body
+          | _ -> doc_flat_option_chain ctx' blocks fallback
+        in
+        ignore (replace_inner_match exp);
+        doc_let_prefix exp
+    | _ -> doc_exp is_monadic ctx' exp
+    )
 
 let doc_termination fixup_binders ctx fnpat (Rec_aux (meas, _)) =
   match meas with

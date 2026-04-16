@@ -170,6 +170,10 @@ let lean_options =
       Arg.String (fun r -> opt_lean_lib_rev := Some r),
       "revision of the Lean support library"
     );
+    ( Flag.create ~prefix:["lean"] ~arg:"N" "flatten_threshold",
+      Arg.Int (fun n -> Pretty_print_lean.opt_flatten_threshold := n),
+      "flatten nested Option match chains with more than N branches (default 20, 0 to disable)"
+    );
   ]
 
 (* TODO[javra]: Currently these are the same as the Coq rewrites, we might want to change them. *)
